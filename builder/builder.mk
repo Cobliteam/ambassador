@@ -24,6 +24,19 @@ BUILDER = BUILDER_NAME=$(BUILDER_NAME) $(abspath $(BUILDER_HOME)/builder.sh)
 DBUILD = $(abspath $(BUILDER_HOME)/dbuild.sh)
 COPY_GOLD = $(abspath $(BUILDER_HOME)/copy-gold.sh)
 
+# the image used for running the Ingress v1 tests with KIND
+# build this image with:
+# 1. checkout the Kuberentes sources in a directory like "~/sources/kubernetes"
+# 2. kind build node-image --kube-root ~/sources/kubernetes
+# 3. docker tag kindest/node:latest quay.io/datawire/kindest-node:latest
+# 4. docker push quay.io/datawire/kindest-node:latest
+# This will not be necessary once the KIND images are built for a Kuberentes that support Ingress v1
+# KIND_IMAGE ?= kindest/node:latest
+KIND_IMAGE ?= quay.io/datawire/kindest-node:latest
+
+# The ingress conformance tests directory
+INGRESS_CONFORMANCE_TESTS_DIR ?= ${HOME}/ingress-conformance-tests
+
 all: help
 .PHONY: all
 
@@ -172,7 +185,63 @@ gotest: test-ready
 		-it $(shell $(BUILDER)) go build -o /dev/null ./cmd/edgectl
 .PHONY: gotest
 
-test: gotest pytest
+# Ingress v1 conformance tests, using KIND and the Ingress Conformance Tests suite.
+ingresstest:
+	@printf "$(CYN)==> $(GRN)Running $(BLU)Ingress v1$(GRN) tests from $(INGRESS_CONFORMANCE_TESTS_DIR)$(END)\n"
+	@[ -n "$(DEV_REGISTRY)" ] || { printf "$(RED)ERROR: no DEV_REGISTRY defined$(END)\n"; exit 1; }
+	@[ -n "$(AMB_IMAGE)" ] || { printf "$(RED)ERROR: no AMB_IMAGE defined$(END)\n"; exit 1; }
+	@[ -n "$(INGRESS_CONFORMANCE_TESTS_DIR)" ] ||  { printf "$(RED)ERROR: no INGRESS_CONFORMANCE_TESTS_DIR defined$(END)\n"; exit 1; }
+	@[ -d "$(INGRESS_CONFORMANCE_TESTS_DIR)" ] ||  { printf "$(RED)ERROR: $(INGRESS_CONFORMANCE_TESTS_DIR) does not seem a valid directory$(END)\n"; exit 1; }
+
+	@# make sure the `ingress-controller-conformance` executable has been built
+	@[ -x $(INGRESS_CONFORMANCE_TESTS_DIR)/ingress-controller-conformance ] || make -C $(INGRESS_CONFORMANCE_TESTS_DIR)
+
+	@printf "$(CYN)==> $(GRN)Creating cluster with KIND$(END)\n"
+	kind delete cluster 2>/dev/null || /bin/true
+	kind create cluster --image $(KIND_IMAGE)
+
+	@printf "$(CYN)==> $(GRN)Showing some cluster info:$(END)\n"
+	@kubectl cluster-info
+	@kubectl version
+
+	@printf "$(CYN)==> $(GRN)Loading Ambassador (from the Ingress conformance tests) with image=$(AMB_IMAGE)$(END)\n"
+	@for f in $(INGRESS_CONFORMANCE_TESTS_DIR)/examples/ambassador/*.yaml ; do \
+  		printf "$(CYN)==> $(GRN)... $$f $(END)\n" ; \
+		cat $$f | sed -e "s|image:.*ambassador\:.*|image: $(AMB_IMAGE)|g" | tee /dev/tty | kubectl apply -f - ; \
+	done
+
+	@printf "$(CYN)==> $(GRN)Exposing Ambassador service$(END)\n"
+	@kubectl apply -f https://raw.githubusercontent.com/inercia/klipper-lb/master/klipper.yaml
+	@kubectl set env daemonset -n kube-system svclb-klipper DEST_ADDR="ingress-ambassador.ingress-ambassador"
+	@kubectl rollout restart -n kube-system daemonset svclb-klipper
+	@sleep 10
+
+	@printf "$(CYN)==> $(GRN)Loading the Ingress conformance tests manifests$(END)\n"
+	@$(INGRESS_CONFORMANCE_TESTS_DIR)/ingress-controller-conformance apply \
+		--api-version=networking.k8s.io/v1beta1 \
+		--ingress-controller=getambassador.io/ingress-controller \
+		--ingress-class=ambassador
+	@sleep 10
+
+	@$(eval AMB_IP = $(shell kubectl get service -n ingress-ambassador ingress-ambassador -o 'go-template={{range .spec.externalIPs}}{{print . "\n"}}{{end}}' | head -n1))
+	@[ -n "$(AMB_IP)" ] || { printf "$(RED)ERROR: no IP obtained for the Ambassador Ingress service$(END)\n"; exit 1; }
+
+	@printf "$(CYN)==> $(GRN)Waiting until $(AMB_IP) is alive...$(END)\n"
+	@until curl --silent "http://$(AMB_IP)" ; do printf "$(CYN)==> $(GRN)... still waiting.$(END)\n" ; sleep 2 ; done
+	@printf "$(CYN)==> $(GRN)... $(AMB_IP) seems to be ready.$(END)\n"
+
+	@printf "$(CYN)==> $(GRN)Running the Ingress conformance tests against $(AMB_IP)$(END)\n"
+	$(INGRESS_CONFORMANCE_TESTS_DIR)/ingress-controller-conformance verify \
+		  --api-version=networking.k8s.io/v1beta1 \
+		  --use-insecure-host=$(AMB_IP)
+
+	@if [ -n "$(CLEANUP)" ] ; then \
+		printf "$(CYN)==> $(GRN)We are done. Destroying the cluster now.$(END)\n"; kind delete cluster || /bin/true; \
+	else \
+		printf "$(CYN)==> $(GRN)We are done. You should destroy the cluster with 'kind delete cluster'.$(END)\n"; \
+	fi
+
+test: gotest pytest ingresstest
 .PHONY: test
 
 shell:
